@@ -32,6 +32,10 @@
 #include <WiFiManager.h>
 #include <Preferences.h>
 #include <esp_task_wdt.h>
+#include <ESPmDNS.h>
+#include <ArduinoOTA.h>
+#include <esp_adc_cal.h>
+#include <driver/ledc.h>
 
 // --- CONFIGURATION CONSTANTS ---
 
@@ -75,6 +79,16 @@ namespace Timing {
 
 // ADC Constants
 const uint16_t ADC_MAX_12BIT = 4095;
+const uint8_t ADC_SAMPLES = 32;  // Multisampling for ADC calibration
+
+// PWM Constants (LEDC)
+const uint8_t PWM_CHANNEL = 0;
+const uint32_t PWM_FREQUENCY = 5000;  // 5kHz
+const uint8_t PWM_RESOLUTION = 8;     // 8-bit (0-255)
+
+// OTA Constants
+const char OTA_PASSWORD[] = "esp32update";  // Change this for production
+const char MDNS_HOSTNAME[] = "esp32-multitool";
 
 // NeoPixel Configuration
 #define LED_COUNT 36
@@ -168,11 +182,13 @@ const char* menuItems[] = {
 // Load credentials from NVS or use defaults
 char www_username[32] = "admin";
 char www_password[64] = "";  // Empty = no auth initially
+char ota_password[64] = "";  // OTA password
 
 void loadWebCredentials() {
   preferences.begin("auth", true);  // Read-only
   preferences.getString("user", www_username, sizeof(www_username));
   preferences.getString("pass", www_password, sizeof(www_password));
+  preferences.getString("otapass", ota_password, sizeof(ota_password));
   preferences.end();
 
   // If no password set, use default for first setup
@@ -180,9 +196,89 @@ void loadWebCredentials() {
     strcpy(www_password, "changeme");
     Serial.println(F("WARNING: Using default password 'changeme' - please change it!"));
   }
+
+  if (strlen(ota_password) == 0) {
+    strcpy(ota_password, OTA_PASSWORD);
+  }
 }
 
 // --- HELPER FUNCTIONS ---
+
+/**
+ * I2C Device name lookup table
+ */
+const char* getI2CDeviceName(uint8_t addr) {
+  switch (addr) {
+    case 0x20: case 0x21: case 0x22: case 0x23:
+    case 0x24: case 0x25: case 0x26: case 0x27:
+      return "MCP23017/PCF8574";
+    case 0x3C: case 0x3D:
+      return "SSD1306 OLED";
+    case 0x40: case 0x41: case 0x42: case 0x43:
+      return "PCA9685/INA219";
+    case 0x48: case 0x49: case 0x4A: case 0x4B:
+      return "ADS1115/TMP102";
+    case 0x50: case 0x51: case 0x52: case 0x53:
+      return "EEPROM (AT24)";
+    case 0x57:
+      return "EEPROM (AT24)";
+    case 0x68: case 0x69:
+      return "MPU6050/DS3231";
+    case 0x76: case 0x77:
+      return "BMP280/BME280";
+    default:
+      return "Unknown";
+  }
+}
+
+/**
+ * Apply gamma correction for LED dimming
+ * Makes brightness feel more linear to human eye
+ */
+uint8_t gammaCorrect(uint8_t brightness) {
+  // Simple gamma correction (gamma ~2.2)
+  static const uint8_t PROGMEM gamma8[] = {
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  1,  1,  1,  1,
+    1,  1,  1,  1,  1,  1,  1,  1,  1,  2,  2,  2,  2,  2,  2,  2,
+    2,  3,  3,  3,  3,  3,  3,  3,  4,  4,  4,  4,  4,  5,  5,  5,
+    5,  6,  6,  6,  6,  7,  7,  7,  7,  8,  8,  8,  9,  9,  9, 10,
+   10, 10, 11, 11, 11, 12, 12, 13, 13, 13, 14, 14, 15, 15, 16, 16,
+   17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 24, 24, 25,
+   25, 26, 27, 27, 28, 29, 29, 30, 31, 32, 32, 33, 34, 35, 35, 36,
+   37, 38, 39, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 50,
+   51, 52, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 66, 67, 68,
+   69, 70, 72, 73, 74, 75, 77, 78, 79, 81, 82, 83, 85, 86, 87, 89,
+   90, 92, 93, 95, 96, 98, 99,101,102,104,105,107,109,110,112,114,
+  115,117,119,120,122,124,126,127,129,131,133,135,137,138,140,142,
+  144,146,148,150,152,154,156,158,160,162,164,167,169,171,173,175,
+  177,180,182,184,186,189,191,193,196,198,200,203,205,208,210,213,
+  215,218,220,223,225,228,231,233,236,239,241,244,247,249,252,255
+  };
+  return pgm_read_byte(&gamma8[brightness]);
+}
+
+/**
+ * Read ADC with multisampling and calibration
+ */
+uint32_t readCalibratedADC(uint8_t pin) {
+  static esp_adc_cal_characteristics_t adc_chars;
+  static bool adc_calibrated = false;
+
+  if (!adc_calibrated) {
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
+    adc_calibrated = true;
+  }
+
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < ADC_SAMPLES; i++) {
+    sum += analogRead(pin);
+  }
+  uint32_t avgRaw = sum / ADC_SAMPLES;
+
+  // Convert to millivolts
+  return esp_adc_cal_raw_to_voltage(avgRaw, &adc_chars);
+}
 
 /**
  * Check if button is pressed with debouncing
@@ -373,6 +469,97 @@ void handleRelayOff() {
 }
 
 /**
+ * Handle password change form
+ */
+void handlePasswordForm() {
+  if (!server.authenticate(www_username, www_password)) {
+    return server.requestAuthentication();
+  }
+
+  WiFiClient client = server.client();
+  client.println(F("HTTP/1.1 200 OK"));
+  client.println(F("Content-Type: text/html"));
+  client.println(F("Connection: close"));
+  client.println();
+
+  client.println(F("<!DOCTYPE html><html><head><title>Change Password</title>"));
+  client.println(F("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"));
+  client.println(F("<style>"));
+  client.println(F("body{background:#000;color:#0f0;font-family:monospace;padding:20px;font-size:1.2rem;}"));
+  client.println(F("h1{border-bottom:2px solid #0f0;padding-bottom:10px;}"));
+  client.println(F("form{max-width:500px;margin:20px auto;border:1px solid #333;padding:20px;}"));
+  client.println(F("label{display:block;margin:15px 0 5px;}"));
+  client.println(F("input{width:100%;padding:10px;background:#111;color:#0f0;border:1px solid #0f0;font-size:1rem;}"));
+  client.println(F("button{background:#0f0;color:#000;border:none;padding:15px;margin:20px 0;width:100%;font-size:1.2rem;cursor:pointer;}"));
+  client.println(F("button:active{background:#fff;}"));
+  client.println(F(".back{background:#333;color:#0f0;margin-top:10px;}"));
+  client.println(F("</style></head><body>"));
+  client.println(F("<h1>CHANGE PASSWORD</h1>"));
+  client.println(F("<form method=\"POST\" action=\"/password/update\">"));
+  client.println(F("<label>Current Password:</label>"));
+  client.println(F("<input type=\"password\" name=\"current\" required>"));
+  client.println(F("<label>New Web Password:</label>"));
+  client.println(F("<input type=\"password\" name=\"newpass\" required minlength=\"8\">"));
+  client.println(F("<label>New OTA Password:</label>"));
+  client.println(F("<input type=\"password\" name=\"otapass\" required minlength=\"8\">"));
+  client.println(F("<button type=\"submit\">UPDATE PASSWORDS</button>"));
+  client.println(F("</form>"));
+  client.println(F("<form action=\"/\"><button class=\"back\">BACK</button></form>"));
+  client.println(F("</body></html>"));
+  client.stop();
+}
+
+/**
+ * Handle password update
+ */
+void handlePasswordUpdate() {
+  if (!server.authenticate(www_username, www_password)) {
+    return server.requestAuthentication();
+  }
+
+  if (server.method() != HTTP_POST) {
+    server.send(405, F("text/plain"), F("Method Not Allowed"));
+    return;
+  }
+
+  // Get form data
+  char currentPass[64];
+  char newPass[64];
+  char newOTAPass[64];
+
+  server.arg("current").toCharArray(currentPass, sizeof(currentPass));
+  server.arg("newpass").toCharArray(newPass, sizeof(newPass));
+  server.arg("otapass").toCharArray(newOTAPass, sizeof(newOTAPass));
+
+  // Verify current password
+  if (strcmp(currentPass, www_password) != 0) {
+    server.send(401, F("text/plain"), F("Current password incorrect"));
+    return;
+  }
+
+  // Validate new password length
+  if (strlen(newPass) < 8 || strlen(newOTAPass) < 8) {
+    server.send(400, F("text/plain"), F("New passwords must be at least 8 characters"));
+    return;
+  }
+
+  // Save to NVS
+  preferences.begin("auth", false);  // Read-write
+  preferences.putString("pass", newPass);
+  preferences.putString("otapass", newOTAPass);
+  preferences.end();
+
+  // Update runtime variables
+  strcpy(www_password, newPass);
+  strcpy(ota_password, newOTAPass);
+
+  Serial.println(F("Passwords updated successfully"));
+
+  server.sendHeader(F("Location"), F("/"));
+  server.send(303);
+}
+
+/**
  * Handle 404 errors
  */
 void handleNotFound() {
@@ -426,10 +613,106 @@ void wifiTask(void* parameter) {
   // Set WiFi power
   WiFi.setTxPower(WiFiConfig::TX_POWER);
 
+  // Setup mDNS
+  if (MDNS.begin(MDNS_HOSTNAME)) {
+    Serial.print(F("mDNS started: "));
+    Serial.print(MDNS_HOSTNAME);
+    Serial.println(F(".local"));
+
+    // Add service discovery
+    MDNS.addService("http", "tcp", 80);
+    MDNS.addService("arduino", "tcp", 3232);  // OTA port
+  } else {
+    Serial.println(F("WARNING: mDNS failed to start"));
+  }
+
+  // Setup OTA
+  ArduinoOTA.setHostname(MDNS_HOSTNAME);
+  ArduinoOTA.setPassword(ota_password);
+
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = "sketch";
+    } else {  // U_SPIFFS
+      type = "filesystem";
+    }
+    Serial.println("OTA: Starting update - " + type);
+
+    // Show on OLED if available
+    if (displayAvailable && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100))) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println(F("OTA UPDATE"));
+      display.println(F("Starting..."));
+      display.display();
+      xSemaphoreGive(i2cMutex);
+    }
+  });
+
+  ArduinoOTA.onEnd([]() {
+    Serial.println(F("\nOTA: Complete!"));
+    if (displayAvailable && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100))) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println(F("OTA COMPLETE"));
+      display.println(F("Rebooting..."));
+      display.display();
+      xSemaphoreGive(i2cMutex);
+    }
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    uint8_t percent = (progress / (total / 100));
+    Serial.printf("OTA: %u%%\r", percent);
+
+    // Update OLED every 10%
+    static uint8_t lastPercent = 0;
+    if (percent != lastPercent && percent % 10 == 0) {
+      if (displayAvailable && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(50))) {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.println(F("OTA UPDATE"));
+        display.drawRect(0, 20, 128, 20, SSD1306_WHITE);
+        int barWidth = map(percent, 0, 100, 0, 126);
+        display.fillRect(1, 21, barWidth, 18, SSD1306_WHITE);
+        display.setCursor(0, 45);
+        display.print(percent);
+        display.println(F("% complete"));
+        display.display();
+        xSemaphoreGive(i2cMutex);
+      }
+      lastPercent = percent;
+    }
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println(F("Auth Failed"));
+    else if (error == OTA_BEGIN_ERROR) Serial.println(F("Begin Failed"));
+    else if (error == OTA_CONNECT_ERROR) Serial.println(F("Connect Failed"));
+    else if (error == OTA_RECEIVE_ERROR) Serial.println(F("Receive Failed"));
+    else if (error == OTA_END_ERROR) Serial.println(F("End Failed"));
+
+    if (displayAvailable && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100))) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println(F("OTA ERROR"));
+      display.display();
+      xSemaphoreGive(i2cMutex);
+    }
+  });
+
+  ArduinoOTA.begin();
+  Serial.println(F("OTA ready"));
+
   // Setup web server routes
   server.on("/", HTTP_GET, handleRoot);
   server.on("/relay/on", HTTP_POST, handleRelayOn);
   server.on("/relay/off", HTTP_POST, handleRelayOff);
+  server.on("/password", HTTP_GET, handlePasswordForm);
+  server.on("/password/update", HTTP_POST, handlePasswordUpdate);
   server.onNotFound(handleNotFound);
 
   server.begin();
@@ -439,6 +722,9 @@ void wifiTask(void* parameter) {
   unsigned long lastClientCheck = 0;
 
   for (;;) {
+    // Handle OTA updates
+    ArduinoOTA.handle();
+
     // Handle web requests
     server.handleClient();
 
@@ -543,6 +829,11 @@ void setup() {
   strip.clear();
   strip.show();
   Serial.println(F("NeoPixel initialized"));
+
+  // Initialize PWM (LEDC) for 12V dimming (ESP32 core 3.x API)
+  ledcAttach(Pins::PWM_MOSFET, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcWrite(Pins::PWM_MOSFET, 0);  // Start off
+  Serial.println(F("PWM dimming initialized"));
 
   // Load web credentials
   loadWebCredentials();
@@ -783,6 +1074,277 @@ void loop() {
       }
 
       if (buttonPressed()) {
+        currentState = MENU;
+        encoder.setCount(menuSelection * 2);
+      }
+      break;
+    }
+
+    case APP_I2C: {
+      drawHeader("I2C Scanner");
+      static uint8_t foundDevices[128];
+      static uint8_t deviceCount = 0;
+      static bool scanComplete = false;
+      static int scrollPosition = 0;
+
+      // Perform scan once when entering this app
+      if (!scanComplete) {
+        deviceCount = 0;
+
+        if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(500))) {
+          // Scan I2C bus
+          for (uint8_t addr = 1; addr < 127; addr++) {
+            Wire.beginTransmission(addr);
+            if (Wire.endTransmission() == 0) {
+              foundDevices[deviceCount++] = addr;
+            }
+          }
+          xSemaphoreGive(i2cMutex);
+        }
+        scanComplete = true;
+      }
+
+      // Encoder controls scroll position
+      long newPos = encoder.getCount() / 2;
+      if (newPos < 0) {
+        encoder.setCount(0);
+        newPos = 0;
+      }
+      int maxScroll = deviceCount > 4 ? deviceCount - 4 : 0;
+      if (newPos > maxScroll) {
+        encoder.setCount(maxScroll * 2);
+        newPos = maxScroll;
+      }
+      scrollPosition = (int)newPos;
+
+      if (displayAvailable && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100))) {
+        display.setCursor(0, 15);
+        display.print(F("Found: "));
+        display.print(deviceCount);
+        display.println(F(" devices"));
+
+        if (deviceCount == 0) {
+          display.setCursor(0, 30);
+          display.println(F("No I2C devices"));
+          display.println(F("detected!"));
+        } else {
+          // Display devices with scrolling
+          for (int i = 0; i < 4 && (scrollPosition + i) < deviceCount; i++) {
+            uint8_t addr = foundDevices[scrollPosition + i];
+            display.setCursor(0, 30 + (i * 9));
+            display.print(F("0x"));
+            if (addr < 16) display.print(F("0"));
+            display.print(addr, HEX);
+            display.print(F(" "));
+            const char* name = getI2CDeviceName(addr);
+            // Truncate long names to fit
+            char shortName[12];
+            strncpy(shortName, name, 11);
+            shortName[11] = '\0';
+            display.println(shortName);
+          }
+        }
+
+        display.display();
+        xSemaphoreGive(i2cMutex);
+      }
+
+      if (buttonPressed()) {
+        scanComplete = false;  // Reset for next time
+        currentState = MENU;
+        encoder.setCount(menuSelection * 2);
+      }
+      break;
+    }
+
+    case APP_SERVO: {
+      drawHeader("Servo Control");
+      static bool servoAttached = false;
+
+      // Encoder controls angle (0-180)
+      long newPos = encoder.getCount() / 2;
+      if (newPos < 0) {
+        encoder.setCount(0);
+        newPos = 0;
+      }
+      if (newPos > 180) {
+        encoder.setCount(180 * 2);
+        newPos = 180;
+      }
+      int angle = (int)newPos;
+
+      // Attach servo if not already attached
+      if (!servoAttached) {
+        myServo.attach(Pins::SERVO);
+        servoAttached = true;
+      }
+
+      myServo.write(angle);
+
+      if (displayAvailable && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100))) {
+        display.setCursor(0, 20);
+        display.setTextSize(2);
+        display.print(angle);
+        display.println(F(" deg"));
+
+        // Visual indicator
+        display.setTextSize(1);
+        display.setCursor(0, 45);
+        display.print(F("0"));
+        display.setCursor(110, 45);
+        display.println(F("180"));
+        display.drawRect(0, 55, 128, 8, SSD1306_WHITE);
+        int barPos = map(angle, 0, 180, 0, 128);
+        display.fillRect(barPos - 2, 55, 4, 8, SSD1306_WHITE);
+
+        display.display();
+        xSemaphoreGive(i2cMutex);
+      }
+
+      if (buttonPressed()) {
+        myServo.detach();
+        servoAttached = false;
+        currentState = MENU;
+        encoder.setCount(menuSelection * 2);
+      }
+      break;
+    }
+
+    case APP_PWM: {
+      drawHeader("12V PWM Dimming");
+
+      // Encoder controls brightness (0-255)
+      long newPos = encoder.getCount() / 2;
+      if (newPos < 0) {
+        encoder.setCount(0);
+        newPos = 0;
+      }
+      if (newPos > 255) {
+        encoder.setCount(255 * 2);
+        newPos = 255;
+      }
+      uint8_t brightness = (uint8_t)newPos;
+
+      // Apply gamma correction and update PWM
+      uint8_t corrected = gammaCorrect(brightness);
+      ledcWrite(Pins::PWM_MOSFET, corrected);
+
+      if (displayAvailable && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100))) {
+        display.setCursor(0, 20);
+        display.setTextSize(2);
+        display.print(brightness);
+        display.println(F(" / 255"));
+
+        display.setTextSize(1);
+        display.setCursor(0, 40);
+        uint8_t percent = (brightness * 100) / 255;
+        display.print(F("Power: "));
+        display.print(percent);
+        display.println(F("%"));
+
+        // Bar graph
+        display.drawRect(0, 52, 128, 10, SSD1306_WHITE);
+        int barWidth = map(brightness, 0, 255, 0, 128);
+        display.fillRect(0, 52, barWidth, 10, SSD1306_WHITE);
+
+        display.display();
+        xSemaphoreGive(i2cMutex);
+      }
+
+      if (buttonPressed()) {
+        ledcWrite(Pins::PWM_MOSFET, 0);  // Turn off
+        currentState = MENU;
+        encoder.setCount(menuSelection * 2);
+      }
+      break;
+    }
+
+    case APP_STEPPER: {
+      drawHeader("Stepper Motor");
+
+      // Encoder controls speed/direction
+      long speed = encoder.getCount() / 4;  // -100 to +100
+      if (speed < -100) {
+        encoder.setCount(-100 * 4);
+        speed = -100;
+      }
+      if (speed > 100) {
+        encoder.setCount(100 * 4);
+        speed = 100;
+      }
+
+      static unsigned long lastStepTime = 0;
+      static int stepPosition = 0;
+
+      // 28BYJ-48 half-step sequence (8 steps per cycle)
+      static const uint8_t halfStepSeq[8][4] = {
+        {1, 0, 0, 0},
+        {1, 1, 0, 0},
+        {0, 1, 0, 0},
+        {0, 1, 1, 0},
+        {0, 0, 1, 0},
+        {0, 0, 1, 1},
+        {0, 0, 0, 1},
+        {1, 0, 0, 1}
+      };
+
+      if (speed != 0) {
+        unsigned long stepDelay = map(abs((int)speed), 1, 100, 20, 2);  // 2-20ms
+
+        if (millis() - lastStepTime > stepDelay) {
+          if (speed > 0) {
+            stepPosition++;
+            if (stepPosition >= 8) stepPosition = 0;
+          } else {
+            stepPosition--;
+            if (stepPosition < 0) stepPosition = 7;
+          }
+
+          digitalWrite(Pins::STEP1, halfStepSeq[stepPosition][0]);
+          digitalWrite(Pins::STEP2, halfStepSeq[stepPosition][1]);
+          digitalWrite(Pins::STEP3, halfStepSeq[stepPosition][2]);
+          digitalWrite(Pins::STEP4, halfStepSeq[stepPosition][3]);
+
+          lastStepTime = millis();
+        }
+      } else {
+        // Hold position or release (optional: release to save power)
+        digitalWrite(Pins::STEP1, LOW);
+        digitalWrite(Pins::STEP2, LOW);
+        digitalWrite(Pins::STEP3, LOW);
+        digitalWrite(Pins::STEP4, LOW);
+      }
+
+      if (displayAvailable && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100))) {
+        display.setCursor(0, 20);
+        display.setTextSize(2);
+        if (speed > 0) {
+          display.print(F("CW "));
+        } else if (speed < 0) {
+          display.print(F("CCW "));
+        } else {
+          display.print(F("STOP"));
+        }
+
+        display.setTextSize(1);
+        display.setCursor(0, 40);
+        display.print(F("Speed: "));
+        display.print(abs((int)speed));
+        display.println(F("%"));
+
+        display.setCursor(0, 50);
+        display.print(F("Mode: Half-step"));
+
+        display.display();
+        xSemaphoreGive(i2cMutex);
+      }
+
+      if (buttonPressed()) {
+        // Turn off all coils
+        digitalWrite(Pins::STEP1, LOW);
+        digitalWrite(Pins::STEP2, LOW);
+        digitalWrite(Pins::STEP3, LOW);
+        digitalWrite(Pins::STEP4, LOW);
         currentState = MENU;
         encoder.setCount(menuSelection * 2);
       }
