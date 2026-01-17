@@ -1,0 +1,111 @@
+=================================================================
+ESP32 MULTITOOL - WEB INTERFACE INTEGRATION CODE SNIPPET
+=================================================================
+
+This file contains the exact code changes needed to integrate
+the modern web interface into esp32_swiss_army.ino
+
+=================================================================
+STEP 1: ADD INCLUDES (after existing includes around line 40)
+=================================================================
+
+#include <ArduinoJson.h>
+#include "web_interface_dashboard.h"
+#include "web_interface_settings.h"
+#include "web_interface_ota.h"
+#include "web_api_handlers.h"
+
+=================================================================
+STEP 2: ADD TO platformio.ini or install via Library Manager
+=================================================================
+
+bblanchon/ArduinoJson @ ^6.21.0
+
+=================================================================
+STEP 3: REPLACE WEB SERVER ROUTE SETUP (around line 770-780)
+=================================================================
+
+FIND THIS CODE:
+---------------
+  // Setup web server routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/relay/on", HTTP_POST, handleRelayOn);
+  server.on("/relay/off", HTTP_POST, handleRelayOff);
+  server.on("/password", HTTP_GET, handlePasswordForm);
+  server.on("/password/update", HTTP_POST, handlePasswordUpdate);
+  server.onNotFound(handleNotFound);
+
+  server.begin();
+  Serial.println(F("Web server started"));
+
+
+REPLACE WITH THIS:
+------------------
+  // Setup web server routes - MODERN INTERFACE
+  server.on("/", HTTP_GET, []() {
+    if (!server.authenticate(www_username, www_password)) {
+      return server.requestAuthentication();
+    }
+    server.send_P(200, "text/html", DASHBOARD_HTML);
+  });
+
+  server.on("/settings", HTTP_GET, []() {
+    if (!server.authenticate(www_username, www_password)) {
+      return server.requestAuthentication();
+    }
+    server.send_P(200, "text/html", SETTINGS_HTML);
+  });
+
+  server.on("/ota", HTTP_GET, []() {
+    if (!server.authenticate(www_username, www_password)) {
+      return server.requestAuthentication();
+    }
+    server.send_P(200, "text/html", OTA_HTML);
+  });
+
+  server.onNotFound([]() {
+    server.send(404, "text/plain", "Not Found");
+  });
+
+  // Register all API handlers
+  registerAPIHandlers();
+
+  server.begin();
+  Serial.println(F("Web server started"));
+
+
+=================================================================
+STEP 4: OPTIONAL - REMOVE OLD HANDLERS TO SAVE SPACE
+=================================================================
+
+You can delete these functions (lines 399-623):
+- handleRoot()
+- handleRelayOn()
+- handleRelayOff()
+- handlePasswordForm()
+- handlePasswordUpdate()
+- handleNotFound()
+
+IMPORTANT: DO NOT DELETE loadWebCredentials() - it's still used!
+
+=================================================================
+COMPLETE! COMPILE AND UPLOAD
+=================================================================
+
+Your ESP32 Multitool now has a modern cyberpunk web interface!
+
+Access at: http://[your-esp32-ip]/
+Login: admin / changeme (change this immediately!)
+
+Features:
+✓ Real-time dashboard with live sensor graphs
+✓ Relay control with visual feedback
+✓ PWM dimmer slider (0-100%)
+✓ Servo angle control (0-180°)
+✓ I2C device scanner
+✓ Settings page (passwords, MQTT, network)
+✓ OTA firmware update page
+✓ Mobile-responsive design
+✓ Cyberpunk Matrix aesthetic
+
+=================================================================

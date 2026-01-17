@@ -38,6 +38,7 @@
 #include <driver/ledc.h>
 #include <driver/dac.h>
 #include <PubSubClient.h>
+#include <ArduinoJson.h>
 
 // --- CONFIGURATION CONSTANTS ---
 
@@ -200,6 +201,12 @@ const char* menuItems[] = {
 char www_username[32] = "admin";
 char www_password[64] = "";  // Empty = no auth initially
 char ota_password[64] = "";  // OTA password
+
+// Web interface includes (must be after variable declarations)
+#include "web_interface_dashboard.h"
+#include "web_interface_settings.h"
+#include "web_interface_ota.h"
+#include "web_api_handlers.h"
 
 void loadWebCredentials() {
   preferences.begin("auth", true);  // Read-only
@@ -1138,23 +1145,34 @@ void wifiTask(void* parameter) {
   mqttClient.setCallback(mqttCallback);
   Serial.println(F("MQTT configured"));
 
-  // Setup web server routes
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/relay/on", HTTP_POST, handleRelayOn);
-  server.on("/relay/off", HTTP_POST, handleRelayOff);
-  server.on("/password", HTTP_GET, handlePasswordForm);
-  server.on("/password/update", HTTP_POST, handlePasswordUpdate);
-  server.on("/settings", HTTP_GET, handleSettings);
-  server.on("/settings/update", HTTP_POST, handleSettingsUpdate);
+  // Setup web server routes - MODERN INTERFACE
+  server.on("/", HTTP_GET, []() {
+    if (!server.authenticate(www_username, www_password)) {
+      return server.requestAuthentication();
+    }
+    server.send_P(200, "text/html", DASHBOARD_HTML);
+  });
 
-  // JSON API endpoints
-  server.on("/api/sensor", HTTP_GET, handleApiSensor);
-  server.on("/api/relay", handleApiRelay);  // Both GET and POST
-  server.on("/api/pwm", handleApiPwm);      // Both GET and POST
-  server.on("/api/servo", handleApiServo);  // Both GET and POST
-  server.on("/api/system", HTTP_GET, handleApiSystem);
+  server.on("/settings", HTTP_GET, []() {
+    if (!server.authenticate(www_username, www_password)) {
+      return server.requestAuthentication();
+    }
+    server.send_P(200, "text/html", SETTINGS_HTML);
+  });
 
-  server.onNotFound(handleNotFound);
+  server.on("/ota", HTTP_GET, []() {
+    if (!server.authenticate(www_username, www_password)) {
+      return server.requestAuthentication();
+    }
+    server.send_P(200, "text/html", OTA_HTML);
+  });
+
+  server.onNotFound([]() {
+    server.send(404, "text/plain", "Not Found");
+  });
+
+  // Register all API handlers
+  registerAPIHandlers();
 
   server.begin();
   Serial.println(F("Web server started"));
