@@ -486,8 +486,13 @@ void setup() {
 
   Serial.println(F("Mutexes created successfully"));
 
-  // Configure watchdog timer
-  esp_task_wdt_init(Timing::WATCHDOG_TIMEOUT_MS / 1000, true);
+  // Configure watchdog timer (ESP32 core 3.x API)
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = Timing::WATCHDOG_TIMEOUT_MS,
+    .idle_core_mask = 0,  // Don't watch idle tasks
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);
   esp_task_wdt_add(NULL);  // Add setup/loop task
 
   // Initialize GPIO pins
