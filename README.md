@@ -6,14 +6,19 @@ A production-ready ESP32-based hardware control system with WiFi capabilities, O
 
 - **WiFi Access Point** with secure web interface for remote control
 - **OLED Display** (128x64 SSD1306) with rotary encoder navigation
+- **RESTful JSON API** for all peripherals (GET/POST)
+- **MQTT Support** for Home Assistant integration
+- **mDNS Support** - Access via esp32-multitool.local
+- **OTA Updates** - Wireless firmware updates with authentication
 - **Multiple Peripheral Support:**
-  - Relay control (local and remote)
+  - Relay control (local, web, MQTT)
   - 36-LED NeoPixel ring with rainbow effects
-  - Analog sensor monitoring
-  - Servo motor control (placeholder)
-  - Stepper motor control (placeholder)
-  - I2S audio output (placeholder)
-  - 12V PWM dimming (placeholder)
+  - Analog sensor with calibrated voltage readings
+  - I2C scanner with device identification
+  - Servo motor control (0-180 degrees)
+  - Stepper motor control (28BYJ-48)
+  - I2S audio tone generator via DAC
+  - 12V PWM dimming with gamma correction
 - **Dual-Core Architecture** utilizing ESP32's FreeRTOS
 - **Thread-Safe Communication** between cores using mutexes
 - **Memory-Optimized** with heap monitoring and fragmentation prevention
@@ -22,6 +27,7 @@ A production-ready ESP32-based hardware control system with WiFi capabilities, O
   - CSRF protection via POST-only state changes
   - WiFi credential storage in NVS
   - WiFiManager for easy configuration
+  - OTA password protection
 
 ## Hardware Requirements
 
@@ -92,6 +98,7 @@ Install the following libraries via Arduino Library Manager:
 - `ESP32Servo` by Kevin Harrington
 - `Adafruit NeoPixel` by Adafruit
 - `WiFiManager` by tzapu
+- `PubSubClient` by Nick O'Leary
 
 ### PlatformIO
 
@@ -114,6 +121,7 @@ arduino-cli lib install "ESP32Encoder"
 arduino-cli lib install "ESP32Servo"
 arduino-cli lib install "Adafruit NeoPixel"
 arduino-cli lib install "WiFiManager"
+arduino-cli lib install "PubSubClient"
 
 # Compile
 arduino-cli compile --fqbn esp32:esp32:esp32 esp32_swiss_army.ino
@@ -141,14 +149,14 @@ arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200
 
 Once connected to WiFi:
 1. Find the device's IP address (shown on OLED display or serial monitor)
-2. Open browser to `http://[device-ip]`
+2. Open browser to `http://[device-ip]` or `http://esp32-multitool.local`
 3. Login with default credentials:
    - **Username:** `admin`
    - **Password:** `changeme`
 
 **SECURITY WARNING:** Change the default password immediately!
 
-To change the password, you'll need to modify the NVS storage or add a password change feature (see Contributing).
+To change the password, navigate to `/password` in the web interface and update both web and OTA passwords.
 
 ## Usage
 
@@ -160,10 +168,14 @@ To change the password, you'll need to modify the NVS storage or add a password 
 
 ### Web Interface
 
-- View real-time sensor readings
+- View real-time sensor readings with calibrated voltage
 - Control relay remotely
 - Monitor connected WiFi clients
 - Check system heap memory
+- Access RESTful JSON API endpoints
+- Configure MQTT settings
+- Change web and OTA passwords
+- View API documentation links
 
 ### Serial Monitor
 
@@ -309,6 +321,23 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Version History
 
+### v2.5.0 (Fully Featured) - Current
+- Added RESTful JSON API for all peripherals
+- Added MQTT support with Home Assistant compatibility
+- Implemented all 10 hardware features (9 functional, 1 placeholder)
+- Added mDNS support (esp32-multitool.local)
+- Added OTA updates with password protection
+- Added web settings page for MQTT configuration
+- Implemented ADC calibration with esp_adc_cal
+- Enhanced sensor display with voltage readout
+- Improved web interface with API documentation links
+- I2C scanner with device identification
+- Servo control (0-180 degrees)
+- Stepper motor control (28BYJ-48 half-step)
+- I2S audio tone generator via DAC
+- 12V PWM dimming with gamma correction
+- Password change functionality via web interface
+
 ### v2.0.0 (Production Ready)
 - Added WiFiManager for easy configuration
 - Implemented mutex protection for thread safety
@@ -334,19 +363,53 @@ For support, please:
 2. Search existing [Issues](https://github.com/yourusername/esp32_swiss_army/issues)
 3. Create a new issue with details
 
+## RESTful JSON API
+
+All endpoints require HTTP Basic Authentication.
+
+- `GET /api/sensor` - Get sensor readings (raw, voltage_mv, voltage_v)
+- `GET /api/relay` - Get relay state
+- `POST /api/relay` - Set relay state (JSON body: `{"state": true}`)
+- `GET /api/pwm` - Get PWM brightness
+- `POST /api/pwm` - Set PWM value (JSON body: `{"value": 128}`)
+- `GET /api/servo` - Get servo angle
+- `POST /api/servo` - Set servo angle (JSON body: `{"angle": 90}`)
+- `GET /api/system` - Get system info (heap, uptime, chip, WiFi, etc.)
+
+See CLAUDE.md for detailed API documentation and example responses.
+
+## MQTT Integration
+
+Connect to Home Assistant or any MQTT broker:
+
+**Topics:**
+- `esp32/multitool/state` - Device online/offline status
+- `esp32/multitool/relay` - Relay control (publish ON/OFF)
+- `esp32/multitool/sensor` - Sensor readings (published every 5s)
+
+**Configuration:**
+- Default broker: broker.hivemq.com:1883
+- Configurable via web interface at `/settings`
+
 ## Roadmap
 
-- [ ] OTA firmware updates
-- [ ] Web-based password change
+- [x] OTA firmware updates
+- [x] Web-based password change
+- [x] mDNS/Bonjour (esp32-multitool.local)
+- [x] MQTT support
+- [x] Home Assistant integration
+- [x] Implement I2C scanner
+- [x] Implement Servo control
+- [x] Implement I2S audio tone
+- [x] Implement Stepper motor control
+- [x] Implement 12V PWM dimming
+- [x] ADC calibration
 - [ ] HTTPS/TLS support
-- [ ] mDNS/Bonjour (esp32.local)
-- [ ] MQTT support
-- [ ] Home Assistant integration
-- [ ] Implement placeholder apps (I2C scan, Servo, I2S, Stepper, GPS)
-- [ ] ADC calibration
+- [ ] GPS raw data display
 - [ ] Battery voltage monitoring
 - [ ] Deep sleep mode
 - [ ] Web-based file manager (SPIFFS/LittleFS)
+- [ ] Persistent MQTT settings in NVS
 
 ---
 

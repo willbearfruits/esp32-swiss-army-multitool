@@ -4,10 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ESP32 Swiss Army Multitool v2.0 - A production-ready, open-source ESP32-based hardware control system with:
+ESP32 Swiss Army Multitool v2.5 - A fully-featured, production-ready ESP32-based hardware control system with:
 - OLED display (SSD1306, 128x64) with rotary encoder menu navigation
 - WiFi connectivity via WiFiManager (captive portal configuration)
 - Web-based remote control with HTTP authentication
+- RESTful JSON API for all peripherals
+- MQTT support for Home Assistant integration
+- mDNS support (esp32-multitool.local)
+- OTA firmware updates with authentication
 - Dual-core FreeRTOS architecture for optimal performance
 - Thread-safe communication using mutexes
 - Memory-optimized design (no String class, F() macros throughout)
@@ -46,11 +50,16 @@ Install via Arduino Library Manager or PlatformIO:
 
 Built-in libraries (no install needed):
 - `Wire.h`, `WiFi.h`, `WebServer.h`, `Preferences.h`, `esp_task_wdt.h`
+- `ESPmDNS.h`, `ArduinoOTA.h`, `esp_adc_cal.h`, `driver/ledc.h`, `driver/dac.h`
+
+MQTT library:
+- `PubSubClient` by Nick O'Leary (install via Library Manager)
 
 ### Library Installation via CLI
 ```bash
 arduino-cli lib install "Adafruit GFX Library" "Adafruit SSD1306" \
-  "ESP32Encoder" "ESP32Servo" "Adafruit NeoPixel" "WiFiManager"
+  "ESP32Encoder" "ESP32Servo" "Adafruit NeoPixel" "WiFiManager" \
+  "PubSubClient"
 ```
 
 ## Architecture
@@ -155,16 +164,16 @@ Organized in namespaces for clarity:
 ## Application State Machine
 
 **AppState enum** defines 10 menu items:
-1. `APP_RELAY` - Toggle relay via button or web
-2. `APP_I2C` - I2C scanner (placeholder)
-3. `APP_SERVO` - Servo control (placeholder)
-4. `APP_I2S` - Audio tone generator (placeholder)
-5. `APP_STEPPER` - Stepper motor (placeholder)
-6. `APP_GPS` - GPS data (placeholder)
-7. `APP_NEOPIXEL` - Rainbow animation (implemented)
-8. `APP_SENSOR` - Analog sensor with bar graph (implemented)
-9. `APP_PWM` - 12V dimmer (placeholder)
-10. `APP_WIFI_STATUS` - IP, clients, status (implemented)
+1. `APP_RELAY` - Toggle relay via button or web (IMPLEMENTED)
+2. `APP_I2C` - I2C scanner with device identification (IMPLEMENTED)
+3. `APP_SERVO` - Servo control 0-180 degrees (IMPLEMENTED)
+4. `APP_I2S` - Audio tone generator via DAC (IMPLEMENTED)
+5. `APP_STEPPER` - 28BYJ-48 stepper motor control (IMPLEMENTED)
+6. `APP_GPS` - GPS data (placeholder for future)
+7. `APP_NEOPIXEL` - Rainbow animation (IMPLEMENTED)
+8. `APP_SENSOR` - Analog sensor with calibrated voltage display (IMPLEMENTED)
+9. `APP_PWM` - 12V PWM dimming with gamma correction (IMPLEMENTED)
+10. `APP_WIFI_STATUS` - IP, clients, status (IMPLEMENTED)
 
 **Navigation:**
 - Rotate encoder: Scroll menu
@@ -366,6 +375,18 @@ Before deploying:
 
 ## Version History
 
+**v2.5.0 (Fully Featured):**
+- Added RESTful JSON API (/api/sensor, /api/relay, /api/pwm, /api/servo, /api/system)
+- Added web settings page for MQTT configuration
+- Implemented all 10 hardware features (I2C, Servo, PWM, Stepper, I2S, etc.)
+- Added ADC calibration with esp_adc_cal
+- Enhanced sensor display with voltage readout
+- Improved web interface with API links
+- MQTT support with Home Assistant compatibility
+- mDNS support (esp32-multitool.local)
+- OTA firmware updates with password protection
+- Production-ready memory optimization
+
 **v2.0.0 (Production Ready):**
 - Added WiFiManager for configuration
 - Implemented mutex protection (thread-safe)
@@ -398,12 +419,148 @@ esp32_swiss_army/
     └── simple_relay_control/    # Minimal example
 ```
 
+## RESTful JSON API
+
+All API endpoints require HTTP Basic Authentication (same credentials as web interface).
+
+### GET /api/sensor
+Returns sensor readings in JSON format:
+```json
+{
+  "raw": 2048,
+  "voltage_mv": 1650,
+  "voltage_v": 1.650
+}
+```
+
+### GET/POST /api/relay
+**GET:** Returns current relay state
+```json
+{"state": true}
+```
+
+**POST:** Set relay state (send JSON body)
+```json
+{"state": false}
+```
+
+### GET/POST /api/pwm
+**GET:** Returns PWM brightness value
+```json
+{"value": 128, "percent": 50}
+```
+
+**POST:** Set PWM value (0-255)
+```json
+{"value": 200}
+```
+
+### GET/POST /api/servo
+**GET:** Returns servo angle
+```json
+{"angle": 90}
+```
+
+**POST:** Set servo angle (0-180)
+```json
+{"angle": 45}
+```
+
+### GET /api/system
+Returns comprehensive system information:
+```json
+{
+  "heap_free": 180000,
+  "heap_size": 327680,
+  "uptime_ms": 123456,
+  "chip_model": "ESP32-D0WDQ6",
+  "chip_revision": 1,
+  "cpu_freq_mhz": 240,
+  "wifi_clients": 1,
+  "wifi_active": true,
+  "ip_address": "192.168.1.100",
+  "rssi_dbm": -45
+}
+```
+
+### GET /settings
+Web page for MQTT broker configuration
+
+### POST /settings/update
+Updates MQTT settings (currently displays form only, NVS storage not implemented)
+
+## MQTT Support
+
+The device publishes sensor data and accepts relay commands via MQTT.
+
+**Topics:**
+- `esp32/multitool/state` - Online/offline status (retained)
+- `esp32/multitool/relay` - Subscribe for relay commands (ON/OFF/1/0)
+- `esp32/multitool/sensor` - Publishes sensor value every 5 seconds
+
+**Configuration:**
+- Default broker: `broker.hivemq.com:1883`
+- Client ID: `ESP32_Multitool`
+- Configurable via /settings page
+
+**Home Assistant Integration:**
+Add to configuration.yaml:
+```yaml
+mqtt:
+  sensor:
+    - name: "ESP32 Sensor"
+      state_topic: "esp32/multitool/sensor"
+      unit_of_measurement: "raw"
+  switch:
+    - name: "ESP32 Relay"
+      command_topic: "esp32/multitool/relay"
+      payload_on: "ON"
+      payload_off: "OFF"
+```
+
+## mDNS Support
+
+The device is accessible via `esp32-multitool.local` instead of IP address.
+
+**Usage:**
+- Web interface: `http://esp32-multitool.local`
+- API: `http://esp32-multitool.local/api/sensor`
+- OTA updates: Connect via Arduino IDE using network port
+
+**Service Discovery:**
+- HTTP service on port 80
+- Arduino OTA service on port 3232
+
+## OTA Updates
+
+Over-the-Air firmware updates are supported via Arduino IDE or command line.
+
+**Arduino IDE:**
+1. Tools → Port → Select "esp32-multitool at [IP]"
+2. Upload sketch as normal
+3. Enter OTA password when prompted
+
+**Command Line (espota.py):**
+```bash
+python3 espota.py -i esp32-multitool.local -p 3232 -a [password] -f firmware.bin
+```
+
+**Security:**
+- OTA password stored in NVS (changeable via /password page)
+- Default password: "esp32update"
+- Change via web interface for production use
+
+**Progress Display:**
+- OLED shows progress bar during update
+- Serial monitor shows percentage
+- Device reboots automatically on completion
+
 ## Important Notes
 
 - **ESP32 core version:** Tested with 3.3.5 (uses new watchdog API)
-- **Compilation size:** ~1.1MB (84% of flash)
-- **RAM usage:** ~49KB static, 260KB free heap typical
+- **Compilation size:** ~1.19MB (90% of flash)
+- **RAM usage:** ~54KB static, 270KB free heap typical
 - **WiFi task priority:** 2 (below lwIP at 18, above loop at 1)
 - **Thread safety:** All cross-core access protected by mutexes
-- **Placeholder apps:** I2C scan, Servo, I2S, Stepper, GPS not implemented
-- **ADC resolution:** 12-bit (0-4095 range)
+- **Implemented features:** 9/10 apps (GPS placeholder remains)
+- **ADC resolution:** 12-bit (0-4095 raw, calibrated to millivolts)

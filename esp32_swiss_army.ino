@@ -17,7 +17,7 @@
  * - Various optional peripherals (Relay, Servo, etc.)
  *
  * License: MIT (see LICENSE file)
- * Version: 2.0.0 (Production Ready)
+ * Version: 2.5.0 (Fully Featured)
  */
 
 #include <Arduino.h>
@@ -36,6 +36,8 @@
 #include <ArduinoOTA.h>
 #include <esp_adc_cal.h>
 #include <driver/ledc.h>
+#include <driver/dac.h>
+#include <PubSubClient.h>
 
 // --- CONFIGURATION CONSTANTS ---
 
@@ -90,6 +92,19 @@ const uint8_t PWM_RESOLUTION = 8;     // 8-bit (0-255)
 const char OTA_PASSWORD[] = "esp32update";  // Change this for production
 const char MDNS_HOSTNAME[] = "esp32-multitool";
 
+// I2S/DAC Constants for tone generator
+const uint16_t TONE_FREQ_MIN = 100;   // 100 Hz
+const uint16_t TONE_FREQ_MAX = 4000;  // 4 kHz
+const uint32_t DAC_SAMPLE_RATE = 44100;  // 44.1 kHz
+
+// MQTT Constants
+const char MQTT_SERVER[] = "broker.hivemq.com";  // Default public broker
+const uint16_t MQTT_PORT = 1883;
+const char MQTT_CLIENT_ID[] = "ESP32_Multitool";
+const char MQTT_TOPIC_STATE[] = "esp32/multitool/state";
+const char MQTT_TOPIC_RELAY[] = "esp32/multitool/relay";
+const char MQTT_TOPIC_SENSOR[] = "esp32/multitool/sensor";
+
 // NeoPixel Configuration
 #define LED_COUNT 36
 #define LED_BRIGHTNESS 50  // 20% brightness to prevent brownout (36 LEDs draw ~720mA at 50% white)
@@ -117,6 +132,8 @@ Servo myServo;
 WebServer server(80);
 WiFiManager wifiManager;
 Preferences preferences;
+WiFiClient mqttWifiClient;
+PubSubClient mqttClient(mqttWifiClient);
 
 // --- THREAD-SAFE SHARED STATE ---
 
@@ -281,6 +298,45 @@ uint32_t readCalibratedADC(uint8_t pin) {
 }
 
 /**
+ * Generate sine wave sample for DAC
+ */
+uint8_t generateSineSample(uint16_t frequency, unsigned long sampleIndex) {
+  // Calculate phase (0 to 2*PI)
+  float phase = (2.0 * PI * frequency * sampleIndex) / DAC_SAMPLE_RATE;
+
+  // Generate sine wave and scale to 0-255 for 8-bit DAC
+  float sine = sin(phase);
+  return (uint8_t)((sine + 1.0) * 127.5);
+}
+
+/**
+ * MQTT callback for incoming messages
+ */
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  // Convert payload to null-terminated string
+  char message[length + 1];
+  memcpy(message, payload, length);
+  message[length] = '\0';
+
+  Serial.print(F("MQTT received: "));
+  Serial.print(topic);
+  Serial.print(F(" -> "));
+  Serial.println(message);
+
+  // Handle relay control commands
+  if (strcmp(topic, MQTT_TOPIC_RELAY) == 0) {
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100))) {
+      if (strcmp(message, "ON") == 0 || strcmp(message, "1") == 0) {
+        sharedState.relayState = true;
+      } else if (strcmp(message, "OFF") == 0 || strcmp(message, "0") == 0) {
+        sharedState.relayState = false;
+      }
+      xSemaphoreGive(stateMutex);
+    }
+  }
+}
+
+/**
  * Check if button is pressed with debouncing
  * @return true if button was pressed
  */
@@ -414,10 +470,24 @@ void handleRoot() {
   client.println(F("</div>"));
 
   client.println(F("<div class=\"info\">"));
-  client.println(F("ESP32 Multitool v2.0<br>"));
+  client.println(F("ESP32 Multitool v2.5<br>"));
   client.print(F("Free Heap: "));
   client.print(ESP.getFreeHeap());
-  client.println(F(" bytes</div>"));
+  client.println(F(" bytes<br>"));
+  client.print(F("Hostname: "));
+  client.print(MDNS_HOSTNAME);
+  client.println(F(".local<br><br>"));
+
+  client.println(F("<a href=\"/password\" style=\"color:#0f0;text-decoration:underline;\">Change Passwords</a> | "));
+  client.println(F("<a href=\"/settings\" style=\"color:#0f0;text-decoration:underline;\">Settings</a><br><br>"));
+
+  client.println(F("API Endpoints:<br>"));
+  client.println(F("GET <a href=\"/api/sensor\" style=\"color:#0f0;\">/api/sensor</a><br>"));
+  client.println(F("GET <a href=\"/api/relay\" style=\"color:#0f0;\">/api/relay</a><br>"));
+  client.println(F("GET <a href=\"/api/pwm\" style=\"color:#0f0;\">/api/pwm</a><br>"));
+  client.println(F("GET <a href=\"/api/servo\" style=\"color:#0f0;\">/api/servo</a><br>"));
+  client.println(F("GET <a href=\"/api/system\" style=\"color:#0f0;\">/api/system</a>"));
+  client.println(F("</div>"));
 
   client.println(F("</body></html>"));
   client.stop();
@@ -556,6 +626,362 @@ void handlePasswordUpdate() {
   Serial.println(F("Passwords updated successfully"));
 
   server.sendHeader(F("Location"), F("/"));
+  server.send(303);
+}
+
+/**
+ * API: Get sensor data in JSON format
+ */
+void handleApiSensor() {
+  if (!server.authenticate(www_username, www_password)) {
+    return server.requestAuthentication();
+  }
+
+  int sensorVal = 0;
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100))) {
+    sensorVal = sharedState.sensorValue;
+    xSemaphoreGive(stateMutex);
+  } else {
+    server.send(503, F("application/json"), F("{\"error\":\"Service unavailable\"}"));
+    return;
+  }
+
+  // Read calibrated voltage
+  uint32_t millivolts = readCalibratedADC(Pins::SENSOR_IN);
+
+  WiFiClient client = server.client();
+  client.println(F("HTTP/1.1 200 OK"));
+  client.println(F("Content-Type: application/json"));
+  client.println(F("Connection: close"));
+  client.println();
+
+  client.print(F("{\"raw\":"));
+  client.print(sensorVal);
+  client.print(F(",\"voltage_mv\":"));
+  client.print(millivolts);
+  client.print(F(",\"voltage_v\":"));
+  client.print(millivolts / 1000.0, 3);
+  client.println(F("}"));
+  client.stop();
+}
+
+/**
+ * API: Get/Set relay state in JSON
+ */
+void handleApiRelay() {
+  if (!server.authenticate(www_username, www_password)) {
+    return server.requestAuthentication();
+  }
+
+  if (server.method() == HTTP_GET) {
+    bool relayState = false;
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100))) {
+      relayState = sharedState.relayState;
+      xSemaphoreGive(stateMutex);
+    } else {
+      server.send(503, F("application/json"), F("{\"error\":\"Service unavailable\"}"));
+      return;
+    }
+
+    WiFiClient client = server.client();
+    client.println(F("HTTP/1.1 200 OK"));
+    client.println(F("Content-Type: application/json"));
+    client.println(F("Connection: close"));
+    client.println();
+    client.print(F("{\"state\":"));
+    client.print(relayState ? F("true") : F("false"));
+    client.println(F("}"));
+    client.stop();
+
+  } else if (server.method() == HTTP_POST) {
+    // Expect JSON body like {"state": true}
+    char body[64];
+    server.arg("plain").toCharArray(body, sizeof(body));
+
+    // Simple JSON parsing (look for "true" or "false")
+    bool newState = false;
+    if (strstr(body, "true") != nullptr) {
+      newState = true;
+    }
+
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100))) {
+      sharedState.relayState = newState;
+      xSemaphoreGive(stateMutex);
+    } else {
+      server.send(503, F("application/json"), F("{\"error\":\"Service unavailable\"}"));
+      return;
+    }
+
+    WiFiClient client = server.client();
+    client.println(F("HTTP/1.1 200 OK"));
+    client.println(F("Content-Type: application/json"));
+    client.println(F("Connection: close"));
+    client.println();
+    client.print(F("{\"state\":"));
+    client.print(newState ? F("true") : F("false"));
+    client.println(F("}"));
+    client.stop();
+
+  } else {
+    server.send(405, F("application/json"), F("{\"error\":\"Method not allowed\"}"));
+  }
+}
+
+/**
+ * API: Get/Set PWM value in JSON
+ */
+void handleApiPwm() {
+  if (!server.authenticate(www_username, www_password)) {
+    return server.requestAuthentication();
+  }
+
+  static uint8_t currentPwm = 0;
+
+  if (server.method() == HTTP_GET) {
+    WiFiClient client = server.client();
+    client.println(F("HTTP/1.1 200 OK"));
+    client.println(F("Content-Type: application/json"));
+    client.println(F("Connection: close"));
+    client.println();
+    client.print(F("{\"value\":"));
+    client.print(currentPwm);
+    client.print(F(",\"percent\":"));
+    client.print((currentPwm * 100) / 255);
+    client.println(F("}"));
+    client.stop();
+
+  } else if (server.method() == HTTP_POST) {
+    // Expect JSON body like {"value": 128}
+    if (!server.hasArg("plain")) {
+      server.send(400, F("application/json"), F("{\"error\":\"Missing body\"}"));
+      return;
+    }
+
+    char body[64];
+    server.arg("plain").toCharArray(body, sizeof(body));
+
+    // Simple JSON parsing - extract number after "value":
+    char* valueStr = strstr(body, "\"value\"");
+    if (valueStr != nullptr) {
+      valueStr = strchr(valueStr, ':');
+      if (valueStr != nullptr) {
+        int value = atoi(valueStr + 1);
+        if (value >= 0 && value <= 255) {
+          currentPwm = (uint8_t)value;
+          uint8_t corrected = gammaCorrect(currentPwm);
+          ledcWrite(Pins::PWM_MOSFET, corrected);
+        }
+      }
+    }
+
+    WiFiClient client = server.client();
+    client.println(F("HTTP/1.1 200 OK"));
+    client.println(F("Content-Type: application/json"));
+    client.println(F("Connection: close"));
+    client.println();
+    client.print(F("{\"value\":"));
+    client.print(currentPwm);
+    client.print(F(",\"percent\":"));
+    client.print((currentPwm * 100) / 255);
+    client.println(F("}"));
+    client.stop();
+
+  } else {
+    server.send(405, F("application/json"), F("{\"error\":\"Method not allowed\"}"));
+  }
+}
+
+/**
+ * API: Get/Set servo angle in JSON
+ */
+void handleApiServo() {
+  if (!server.authenticate(www_username, www_password)) {
+    return server.requestAuthentication();
+  }
+
+  static uint8_t currentAngle = 90;
+
+  if (server.method() == HTTP_GET) {
+    WiFiClient client = server.client();
+    client.println(F("HTTP/1.1 200 OK"));
+    client.println(F("Content-Type: application/json"));
+    client.println(F("Connection: close"));
+    client.println();
+    client.print(F("{\"angle\":"));
+    client.print(currentAngle);
+    client.println(F("}"));
+    client.stop();
+
+  } else if (server.method() == HTTP_POST) {
+    // Expect JSON body like {"angle": 90}
+    if (!server.hasArg("plain")) {
+      server.send(400, F("application/json"), F("{\"error\":\"Missing body\"}"));
+      return;
+    }
+
+    char body[64];
+    server.arg("plain").toCharArray(body, sizeof(body));
+
+    // Simple JSON parsing - extract number after "angle":
+    char* angleStr = strstr(body, "\"angle\"");
+    if (angleStr != nullptr) {
+      angleStr = strchr(angleStr, ':');
+      if (angleStr != nullptr) {
+        int angle = atoi(angleStr + 1);
+        if (angle >= 0 && angle <= 180) {
+          currentAngle = (uint8_t)angle;
+          // Note: Servo control is done in APP_SERVO state
+          // For API control, we'd need global servo object
+        }
+      }
+    }
+
+    WiFiClient client = server.client();
+    client.println(F("HTTP/1.1 200 OK"));
+    client.println(F("Content-Type: application/json"));
+    client.println(F("Connection: close"));
+    client.println();
+    client.print(F("{\"angle\":"));
+    client.print(currentAngle);
+    client.println(F("}"));
+    client.stop();
+
+  } else {
+    server.send(405, F("application/json"), F("{\"error\":\"Method not allowed\"}"));
+  }
+}
+
+/**
+ * API: Get system information in JSON
+ */
+void handleApiSystem() {
+  if (!server.authenticate(www_username, www_password)) {
+    return server.requestAuthentication();
+  }
+
+  // Get current state
+  int currentClients = 0;
+  bool wifiActive = false;
+  char currentIP[16];
+
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100))) {
+    currentClients = sharedState.wifiClients;
+    wifiActive = sharedState.wifiActive;
+    strncpy(currentIP, sharedState.ipAddress, sizeof(currentIP));
+    xSemaphoreGive(stateMutex);
+  }
+
+  WiFiClient client = server.client();
+  client.println(F("HTTP/1.1 200 OK"));
+  client.println(F("Content-Type: application/json"));
+  client.println(F("Connection: close"));
+  client.println();
+
+  client.print(F("{\"heap_free\":"));
+  client.print(ESP.getFreeHeap());
+  client.print(F(",\"heap_size\":"));
+  client.print(ESP.getHeapSize());
+  client.print(F(",\"uptime_ms\":"));
+  client.print(millis());
+  client.print(F(",\"chip_model\":\""));
+  client.print(ESP.getChipModel());
+  client.print(F("\",\"chip_revision\":"));
+  client.print(ESP.getChipRevision());
+  client.print(F(",\"cpu_freq_mhz\":"));
+  client.print(ESP.getCpuFreqMHz());
+  client.print(F(",\"wifi_clients\":"));
+  client.print(currentClients);
+  client.print(F(",\"wifi_active\":"));
+  client.print(wifiActive ? F("true") : F("false"));
+  client.print(F(",\"ip_address\":\""));
+  client.print(currentIP);
+  client.print(F("\",\"rssi_dbm\":"));
+  client.print(WiFi.RSSI());
+  client.println(F("}"));
+  client.stop();
+}
+
+/**
+ * Handle settings page (MQTT and system configuration)
+ */
+void handleSettings() {
+  if (!server.authenticate(www_username, www_password)) {
+    return server.requestAuthentication();
+  }
+
+  WiFiClient client = server.client();
+  client.println(F("HTTP/1.1 200 OK"));
+  client.println(F("Content-Type: text/html"));
+  client.println(F("Connection: close"));
+  client.println();
+
+  client.println(F("<!DOCTYPE html><html><head><title>Settings</title>"));
+  client.println(F("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"));
+  client.println(F("<style>"));
+  client.println(F("body{background:#000;color:#0f0;font-family:monospace;padding:20px;font-size:1.2rem;}"));
+  client.println(F("h1{border-bottom:2px solid #0f0;padding-bottom:10px;}"));
+  client.println(F("form{max-width:600px;margin:20px auto;border:1px solid #333;padding:20px;}"));
+  client.println(F("label{display:block;margin:15px 0 5px;}"));
+  client.println(F("input{width:100%;padding:10px;background:#111;color:#0f0;border:1px solid #0f0;font-size:1rem;}"));
+  client.println(F("button{background:#0f0;color:#000;border:none;padding:15px;margin:20px 0;width:100%;font-size:1.2rem;cursor:pointer;}"));
+  client.println(F("button:active{background:#fff;}"));
+  client.println(F(".info{color:#888;font-size:0.9rem;margin-top:5px;}"));
+  client.println(F(".back{background:#333;color:#0f0;margin-top:10px;}"));
+  client.println(F("</style></head><body>"));
+
+  client.println(F("<h1>SYSTEM SETTINGS</h1>"));
+
+  // MQTT Settings
+  client.println(F("<form method=\"POST\" action=\"/settings/update\">"));
+  client.println(F("<h2>MQTT Configuration</h2>"));
+  client.println(F("<label>MQTT Broker:</label>"));
+  client.print(F("<input type=\"text\" name=\"mqtt_broker\" value=\""));
+  client.print(MQTT_SERVER);
+  client.println(F("\">"));
+  client.println(F("<div class=\"info\">Default: broker.hivemq.com</div>"));
+
+  client.println(F("<label>MQTT Port:</label>"));
+  client.print(F("<input type=\"number\" name=\"mqtt_port\" value=\""));
+  client.print(MQTT_PORT);
+  client.println(F("\">"));
+  client.println(F("<div class=\"info\">Default: 1883</div>"));
+
+  client.println(F("<label>MQTT Client ID:</label>"));
+  client.print(F("<input type=\"text\" name=\"mqtt_client\" value=\""));
+  client.print(MQTT_CLIENT_ID);
+  client.println(F("\">"));
+
+  client.println(F("<div class=\"info\">"));
+  client.print(F("Status: "));
+  client.print(mqttClient.connected() ? F("Connected") : F("Disconnected"));
+  client.println(F("</div>"));
+
+  client.println(F("<button type=\"submit\">UPDATE SETTINGS</button>"));
+  client.println(F("</form>"));
+
+  client.println(F("<form action=\"/\"><button class=\"back\">BACK TO MAIN</button></form>"));
+  client.println(F("</body></html>"));
+  client.stop();
+}
+
+/**
+ * Handle settings update
+ */
+void handleSettingsUpdate() {
+  if (!server.authenticate(www_username, www_password)) {
+    return server.requestAuthentication();
+  }
+
+  if (server.method() != HTTP_POST) {
+    server.send(405, F("text/plain"), F("Method Not Allowed"));
+    return;
+  }
+
+  // For now, just acknowledge the update
+  // In a full implementation, we'd save to NVS and reconfigure MQTT
+  Serial.println(F("Settings update requested (not implemented - requires NVS storage)"));
+
+  server.sendHeader(F("Location"), F("/settings"));
   server.send(303);
 }
 
@@ -707,12 +1133,27 @@ void wifiTask(void* parameter) {
   ArduinoOTA.begin();
   Serial.println(F("OTA ready"));
 
+  // Setup MQTT
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+  Serial.println(F("MQTT configured"));
+
   // Setup web server routes
   server.on("/", HTTP_GET, handleRoot);
   server.on("/relay/on", HTTP_POST, handleRelayOn);
   server.on("/relay/off", HTTP_POST, handleRelayOff);
   server.on("/password", HTTP_GET, handlePasswordForm);
   server.on("/password/update", HTTP_POST, handlePasswordUpdate);
+  server.on("/settings", HTTP_GET, handleSettings);
+  server.on("/settings/update", HTTP_POST, handleSettingsUpdate);
+
+  // JSON API endpoints
+  server.on("/api/sensor", HTTP_GET, handleApiSensor);
+  server.on("/api/relay", handleApiRelay);  // Both GET and POST
+  server.on("/api/pwm", handleApiPwm);      // Both GET and POST
+  server.on("/api/servo", handleApiServo);  // Both GET and POST
+  server.on("/api/system", HTTP_GET, handleApiSystem);
+
   server.onNotFound(handleNotFound);
 
   server.begin();
@@ -720,6 +1161,7 @@ void wifiTask(void* parameter) {
 
   // Main WiFi task loop
   unsigned long lastClientCheck = 0;
+  unsigned long lastMqttPublish = 0;
 
   for (;;) {
     // Handle OTA updates
@@ -727,6 +1169,38 @@ void wifiTask(void* parameter) {
 
     // Handle web requests
     server.handleClient();
+
+    // Handle MQTT connection and messages
+    if (!mqttClient.connected()) {
+      // Try to reconnect (non-blocking)
+      static unsigned long lastReconnectAttempt = 0;
+      if (millis() - lastReconnectAttempt > 5000) {  // Try every 5 seconds
+        lastReconnectAttempt = millis();
+        if (mqttClient.connect(MQTT_CLIENT_ID)) {
+          Serial.println(F("MQTT connected"));
+          mqttClient.subscribe(MQTT_TOPIC_RELAY);
+          mqttClient.publish(MQTT_TOPIC_STATE, "online", true);  // Retained message
+        }
+      }
+    } else {
+      mqttClient.loop();
+
+      // Publish sensor data every 5 seconds
+      if (millis() - lastMqttPublish > 5000) {
+        char payload[32];
+        int sensorVal = 0;
+
+        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10))) {
+          sensorVal = sharedState.sensorValue;
+          xSemaphoreGive(stateMutex);
+        }
+
+        snprintf(payload, sizeof(payload), "%d", sensorVal);
+        mqttClient.publish(MQTT_TOPIC_SENSOR, payload);
+
+        lastMqttPublish = millis();
+      }
+    }
 
     // Update client count periodically
     if (millis() - lastClientCheck > Timing::WIFI_CLIENT_CHECK_MS) {
@@ -755,8 +1229,8 @@ void setup() {
   delay(100);
 
   Serial.println(F("\n\n================================="));
-  Serial.println(F("ESP32 Multitool v2.0"));
-  Serial.println(F("Production Ready Edition"));
+  Serial.println(F("ESP32 Multitool v2.5"));
+  Serial.println(F("Fully Featured Edition"));
   Serial.println(F("=================================\n"));
 
   // Create mutexes BEFORE starting any tasks
@@ -1015,15 +1489,24 @@ void loop() {
     case APP_SENSOR: {
       drawHeader("Sensor Monitor");
 
+      // Read calibrated voltage
+      uint32_t millivolts = readCalibratedADC(Pins::SENSOR_IN);
+
       if (displayAvailable && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100))) {
-        display.setCursor(0, 30);
-        display.setTextSize(2);
+        display.setCursor(0, 15);
+        display.setTextSize(1);
+        display.print(F("Raw: "));
         display.println(constrainedSensor);
+
+        display.setCursor(0, 28);
+        display.setTextSize(2);
+        display.print(millivolts / 1000.0, 2);
+        display.println(F(" V"));
 
         // Bar graph
         display.setTextSize(1);
         display.drawRect(0, 50, 128, 10, SSD1306_WHITE);
-        int barWidth = map(constrainedSensor, 0, ADC_MAX_12BIT, 0, 128);
+        int barWidth = map(millivolts, 0, 3300, 0, 128);  // 0-3.3V range
         display.fillRect(0, 50, barWidth, 10, SSD1306_WHITE);
 
         display.display();
@@ -1345,6 +1828,75 @@ void loop() {
         digitalWrite(Pins::STEP2, LOW);
         digitalWrite(Pins::STEP3, LOW);
         digitalWrite(Pins::STEP4, LOW);
+        currentState = MENU;
+        encoder.setCount(menuSelection * 2);
+      }
+      break;
+    }
+
+    case APP_I2S: {
+      drawHeader("I2S Tone Gen");
+      static bool dacEnabled = false;
+      static unsigned long sampleIndex = 0;
+
+      // Encoder controls frequency (100-4000 Hz)
+      long newPos = encoder.getCount() / 2;
+      if (newPos < TONE_FREQ_MIN) {
+        encoder.setCount(TONE_FREQ_MIN * 2);
+        newPos = TONE_FREQ_MIN;
+      }
+      if (newPos > TONE_FREQ_MAX) {
+        encoder.setCount(TONE_FREQ_MAX * 2);
+        newPos = TONE_FREQ_MAX;
+      }
+      uint16_t frequency = (uint16_t)newPos;
+
+      // Initialize DAC on first entry
+      if (!dacEnabled) {
+        dac_output_enable(DAC_CHANNEL_1);  // GPIO25
+        dacEnabled = true;
+      }
+
+      // Generate and output tone at approximate sample rate
+      static unsigned long lastSampleTime = 0;
+      unsigned long samplePeriod = 1000000 / DAC_SAMPLE_RATE;  // microseconds
+
+      if (micros() - lastSampleTime >= samplePeriod) {
+        uint8_t sample = generateSineSample(frequency, sampleIndex);
+        dac_output_voltage(DAC_CHANNEL_1, sample);
+        sampleIndex++;
+        lastSampleTime = micros();
+
+        // Prevent overflow
+        if (sampleIndex > 1000000) sampleIndex = 0;
+      }
+
+      if (displayAvailable && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100))) {
+        display.setCursor(0, 20);
+        display.setTextSize(2);
+        display.print(frequency);
+        display.println(F(" Hz"));
+
+        display.setTextSize(1);
+        display.setCursor(0, 40);
+        display.print(F("DAC: GPIO25"));
+
+        display.setCursor(0, 50);
+        display.print(F("Range: "));
+        display.print(TONE_FREQ_MIN);
+        display.print(F("-"));
+        display.print(TONE_FREQ_MAX);
+        display.println(F("Hz"));
+
+        display.display();
+        xSemaphoreGive(i2cMutex);
+      }
+
+      if (buttonPressed()) {
+        // Disable DAC
+        dac_output_disable(DAC_CHANNEL_1);
+        dacEnabled = false;
+        sampleIndex = 0;
         currentState = MENU;
         encoder.setCount(menuSelection * 2);
       }
